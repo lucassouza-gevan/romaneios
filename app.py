@@ -95,6 +95,8 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
 
     for product_code, group in merged.groupby("codigo"):
         descricao = group["descricao"].iloc[0]
+        saldo_por_garagem = group.set_index("garagem")["saldo"].to_dict()
+        estmax_por_garagem = group.set_index("garagem")["est_max"].to_dict()
 
         surplus = (
             group[group["sobra"] > 0]
@@ -125,6 +127,10 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
                     "Para": to_g,
                     "Código": product_code,
                     "Produto": descricao,
+                    "Saldo Origem": int(saldo_por_garagem.get(from_g, 0)),
+                    "Est. Máx Origem": int(estmax_por_garagem.get(from_g, 0)),
+                    "Saldo Destino": int(saldo_por_garagem.get(to_g, 0)),
+                    "Est. Máx Destino": int(estmax_por_garagem.get(to_g, 0)),
                     "Quantidade": int(transfer),
                 })
                 sobra_restante -= transfer
@@ -183,7 +189,11 @@ if st.button("Calcular Romaneios", type="primary", disabled=not (saldo_file and 
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Quantidade": st.column_config.NumberColumn(format="%d"),
                 "Código": st.column_config.NumberColumn(format="%d"),
+                "Saldo Origem": st.column_config.NumberColumn(format="%d"),
+                "Est. Máx Origem": st.column_config.NumberColumn(format="%d"),
+                "Saldo Destino": st.column_config.NumberColumn(format="%d"),
+                "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
+                "Quantidade": st.column_config.NumberColumn(format="%d"),
             },
         )
