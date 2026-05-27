@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 
-GARAGE_ORDER = ["G1", "G2", "G5", "G6", "G7"]
+GARAGE_ORDER = ["G1", "G2", "G5", "G6"]
 
 
 def normalize_garage(name: str) -> str:
