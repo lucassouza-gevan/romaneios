@@ -2,7 +2,7 @@ import streamlit as st
 import pandas as pd
 import re
 
-GARAGE_ORDER = ["G1", "G2", "G5", "G6"]
+GARAGE_ORDER = ["G1", "G2", "G5", "G6", "G7", "SS"]
 
 
 def normalize_garage(name: str) -> str:
@@ -12,8 +12,32 @@ def normalize_garage(name: str) -> str:
     return name
 
 
-def parse_saldo(file) -> pd.DataFrame:
-    df_raw = pd.read_excel(file, header=None, dtype=str)
+def _to_csv_url(url: str) -> str:
+    """Normaliza um link 'Publicar na web' do Google Sheets para saída CSV."""
+    url = url.strip()
+    if "output=csv" in url:
+        return url
+    if "/pubhtml" in url:
+        url = url.replace("/pubhtml", "/pub")
+    if "/pub" in url:
+        return url + ("&" if "?" in url else "?") + "output=csv"
+    return url
+
+
+@st.cache_data(ttl=300, show_spinner=False)
+def load_saldo_raw() -> pd.DataFrame:
+    """Lê a aba publicada da planilha Google (CSV) de st.secrets['saldo_unid_url']."""
+    try:
+        url = st.secrets["saldo_unid_url"]
+    except (KeyError, FileNotFoundError):
+        raise RuntimeError(
+            "Secret 'saldo_unid_url' não encontrado. Defina a URL da planilha "
+            "Google publicada nos secrets do Streamlit."
+        )
+    return pd.read_csv(_to_csv_url(url), header=None, dtype=str)
+
+
+def parse_saldo(df_raw: pd.DataFrame) -> pd.DataFrame:
     rows = []
     current_garage = None
 
@@ -56,30 +80,48 @@ def parse_saldo(file) -> pd.DataFrame:
     return pd.DataFrame(rows)
 
 
-def parse_maxmin(file) -> pd.DataFrame:
-    df = pd.read_excel(file)
-    df.columns = [c.strip() for c in df.columns]
+@st.cache_data(ttl=300, show_spinner=False)
+def load_maxmin_raw() -> pd.DataFrame:
+    """Lê a aba publicada de máx/mín (CSV wide) de st.secrets['max_min_url']."""
+    try:
+        url = st.secrets["max_min_url"]
+    except (KeyError, FileNotFoundError):
+        raise RuntimeError(
+            "Secret 'max_min_url' não encontrado. Defina a URL da planilha "
+            "Google publicada nos secrets do Streamlit."
+        )
+    return pd.read_csv(_to_csv_url(url), dtype=str)
 
-    # Normalize column names regardless of accent variants
-    col_map = {}
-    for c in df.columns:
-        low = c.lower()
-        if "dep" in low:
-            col_map[c] = "garagem"
-        elif "c" in low and "digo" in low:
-            col_map[c] = "codigo"
-        elif "max" in low:
-            col_map[c] = "est_max"
-        elif "min" in low:
-            col_map[c] = "est_min"
-    df = df.rename(columns=col_map)
 
-    df["garagem"] = df["garagem"].astype(str).str.strip().apply(normalize_garage)
-    df["codigo"] = pd.to_numeric(df["codigo"], errors="coerce")
-    df["est_max"] = pd.to_numeric(df["est_max"], errors="coerce").fillna(0)
-    df = df.dropna(subset=["codigo"])
-    df["codigo"] = df["codigo"].astype(int)
-    return df[["garagem", "codigo", "est_max"]]
+def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
+    """Formato wide: 1ª coluna = código; depois metadados e um bloco de colunas
+    por garagem com o estoque MÁXIMO. Usa a primeira ocorrência de cada garagem
+    (bloco máximo) e ignora o bloco de mínimo — o cálculo só usa o máximo."""
+    df = df.copy()
+    df.columns = [str(c).strip() for c in df.columns]
+
+    codigo = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+
+    # Primeira ocorrência de cada garagem de interesse = bloco do MÁXIMO
+    col_por_garagem = {}
+    for col in df.columns[1:]:
+        g = normalize_garage(col)
+        if g in GARAGE_ORDER and g not in col_por_garagem.values():
+            col_por_garagem[col] = g
+
+    blocos = [
+        pd.DataFrame({
+            "garagem": g,
+            "codigo": codigo,
+            "est_max": pd.to_numeric(df[col], errors="coerce").fillna(0),
+        })
+        for col, g in col_por_garagem.items()
+    ]
+
+    out = pd.concat(blocos, ignore_index=True)
+    out = out.dropna(subset=["codigo"])
+    out["codigo"] = out["codigo"].astype(int)
+    return out[["garagem", "codigo", "est_max"]]
 
 
 def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.DataFrame:
@@ -144,22 +186,18 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
 
 st.set_page_config(page_title="Romaneios entre Garagens", layout="wide")
 st.title("Sugestão de Romaneios entre Garagens")
-st.caption("Distribui o excesso de estoque das garagens com sobra para as garagens com déficit, priorizando G1 → G2 → G5 → G6 → G7.")
+st.caption("Distribui o excesso de estoque das garagens com sobra para as garagens com déficit, priorizando G1 → G2 → G5 → G6 → G7 → SS.")
 
-col1, col2 = st.columns(2)
-with col1:
-    saldo_file = st.file_uploader("Saldo por unidade (saldo-unid.xlsx)", type=["xlsx"])
-with col2:
-    maxmin_file = st.file_uploader("Estoque máximo/mínimo (max-min produtos.xlsx)", type=["xlsx"])
+st.caption("Saldo e estoque máximo/mínimo são lidos automaticamente das planilhas Google publicadas.")
 
-if st.button("Calcular Romaneios", type="primary", disabled=not (saldo_file and maxmin_file)):
+if st.button("Calcular Romaneios", type="primary"):
     with st.spinner("Processando..."):
         try:
-            saldo_df = parse_saldo(saldo_file)
-            maxmin_df = parse_maxmin(maxmin_file)
+            saldo_df = parse_saldo(load_saldo_raw())
+            maxmin_df = parse_maxmin(load_maxmin_raw())
             resultado = calcular_romaneios(saldo_df, maxmin_df)
         except Exception as e:
-            st.error(f"Erro ao processar os arquivos: {e}")
+            st.error(f"Erro ao processar os dados: {e}")
             st.stop()
 
     if resultado.empty:
