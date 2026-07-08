@@ -94,13 +94,23 @@ def load_maxmin_raw() -> pd.DataFrame:
 
 
 def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
-    """Formato wide: 1ª coluna = código; depois metadados e um bloco de colunas
-    por garagem com o estoque MÁXIMO. Usa a primeira ocorrência de cada garagem
-    (bloco máximo) e ignora o bloco de mínimo — o cálculo só usa o máximo."""
+    """Formato wide: 1ª coluna = código; depois metadados (age, pqr, rev) e um
+    bloco de colunas por garagem com o estoque MÁXIMO. Usa a primeira ocorrência
+    de cada garagem (bloco máximo) e ignora o bloco de mínimo — o cálculo só usa
+    o máximo. As colunas age/pqr são preservadas para servirem de filtro."""
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
     codigo = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+
+    def coluna_meta(nome: str) -> pd.Series:
+        for c in df.columns:
+            if c.lower() == nome:
+                return df[c].fillna("").astype(str).str.strip()
+        return pd.Series([""] * len(df), index=df.index)
+
+    age = coluna_meta("age")
+    pqr = coluna_meta("pqr")
 
     # Primeira ocorrência de cada garagem de interesse = bloco do MÁXIMO
     col_por_garagem = {}
@@ -114,6 +124,8 @@ def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
             "garagem": g,
             "codigo": codigo,
             "est_max": pd.to_numeric(df[col], errors="coerce").fillna(0),
+            "age": age,
+            "pqr": pqr,
         })
         for col, g in col_por_garagem.items()
     ]
@@ -121,7 +133,7 @@ def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
     out = pd.concat(blocos, ignore_index=True)
     out = out.dropna(subset=["codigo"])
     out["codigo"] = out["codigo"].astype(int)
-    return out[["garagem", "codigo", "est_max"]]
+    return out[["garagem", "codigo", "est_max", "age", "pqr"]]
 
 
 def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.DataFrame:
@@ -137,6 +149,8 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
 
     for product_code, group in merged.groupby("codigo"):
         descricao = group["descricao"].iloc[0]
+        age = group["age"].iloc[0]
+        pqr = group["pqr"].iloc[0]
         saldo_por_garagem = group.set_index("garagem")["saldo"].to_dict()
         estmax_por_garagem = group.set_index("garagem")["est_max"].to_dict()
 
@@ -174,6 +188,8 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
                     "Saldo Destino": int(saldo_por_garagem.get(to_g, 0)),
                     "Est. Máx Destino": int(estmax_por_garagem.get(to_g, 0)),
                     "Quantidade": int(transfer),
+                    "age": age,
+                    "pqr": pqr,
                 })
                 sobra_restante -= transfer
                 surplus[from_g] = sobra_restante
@@ -203,35 +219,49 @@ if st.button("Calcular Romaneios", type="primary"):
     if resultado.empty:
         st.success("Nenhuma transferência necessária — todos os estoques estão dentro dos limites.")
     else:
-        m1, m2, m3 = st.columns(3)
-        m1.metric("Total de transferências", len(resultado))
-        m2.metric("Produtos afetados", resultado["Código"].nunique())
-        m3.metric("Garagens envolvidas", resultado[["De", "Para"]].stack().nunique())
-
-        st.divider()
-
-        f1, f2 = st.columns(2)
+        f1, f2, f3, f4 = st.columns(4)
         with f1:
-            filtro_de = st.multiselect("Filtrar por garagem de origem (De)", sorted(resultado["De"].unique()))
+            filtro_de = st.multiselect("Origem (De)", sorted(resultado["De"].unique()))
         with f2:
-            filtro_para = st.multiselect("Filtrar por garagem de destino (Para)", sorted(resultado["Para"].unique()))
+            filtro_para = st.multiselect("Destino (Para)", sorted(resultado["Para"].unique()))
+        with f3:
+            filtro_age = st.multiselect("age", sorted(resultado["age"].unique()))
+        with f4:
+            filtro_pqr = st.multiselect("pqr", sorted(resultado["pqr"].unique()))
 
         df_view = resultado.copy()
         if filtro_de:
             df_view = df_view[df_view["De"].isin(filtro_de)]
         if filtro_para:
             df_view = df_view[df_view["Para"].isin(filtro_para)]
+        if filtro_age:
+            df_view = df_view[df_view["age"].isin(filtro_age)]
+        if filtro_pqr:
+            df_view = df_view[df_view["pqr"].isin(filtro_pqr)]
 
-        st.dataframe(
-            df_view,
-            use_container_width=True,
-            hide_index=True,
-            column_config={
-                "Código": st.column_config.NumberColumn(format="%d"),
-                "Saldo Origem": st.column_config.NumberColumn(format="%d"),
-                "Est. Máx Origem": st.column_config.NumberColumn(format="%d"),
-                "Saldo Destino": st.column_config.NumberColumn(format="%d"),
-                "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
-                "Quantidade": st.column_config.NumberColumn(format="%d"),
-            },
+        m1, m2, m3 = st.columns(3)
+        m1.metric("Total de transferências", len(df_view))
+        m2.metric("Produtos afetados", df_view["Código"].nunique())
+        m3.metric(
+            "Garagens envolvidas",
+            df_view[["De", "Para"]].stack().nunique() if not df_view.empty else 0,
         )
+
+        st.divider()
+
+        if df_view.empty:
+            st.info("Nenhum romaneio para os filtros selecionados.")
+        else:
+            st.dataframe(
+                df_view.drop(columns=["age", "pqr"]),
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Código": st.column_config.NumberColumn(format="%d"),
+                    "Saldo Origem": st.column_config.NumberColumn(format="%d"),
+                    "Est. Máx Origem": st.column_config.NumberColumn(format="%d"),
+                    "Saldo Destino": st.column_config.NumberColumn(format="%d"),
+                    "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
+                    "Quantidade": st.column_config.NumberColumn(format="%d"),
+                },
+            )
