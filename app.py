@@ -70,11 +70,19 @@ def parse_saldo(df_raw: pd.DataFrame) -> pd.DataFrame:
         except ValueError:
             qty = 0.0
 
+        # Total stock value (col L, index 11)
+        try:
+            valor_raw = row_vals[11] if len(row_vals) > 11 else ""
+            valor = float(valor_raw.replace(",", ".")) if valor_raw else 0.0
+        except ValueError:
+            valor = 0.0
+
         rows.append({
             "garagem": current_garage,
             "codigo": product_code,
             "descricao": description,
             "saldo": qty,
+            "valor": valor,
         })
 
     return pd.DataFrame(rows)
@@ -153,6 +161,7 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
         pqr = group["pqr"].iloc[0]
         saldo_por_garagem = group.set_index("garagem")["saldo"].to_dict()
         estmax_por_garagem = group.set_index("garagem")["est_max"].to_dict()
+        valor_por_garagem = group.set_index("garagem")["valor"].to_dict()
 
         surplus = (
             group[group["sobra"] > 0]
@@ -178,6 +187,9 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
                 if falta_restante <= 0:
                     continue
                 transfer = min(sobra_restante, falta_restante)
+                # Preço unitário derivado da origem (valor total / saldo)
+                saldo_orig = saldo_por_garagem.get(from_g, 0)
+                preco_unit = valor_por_garagem.get(from_g, 0.0) / saldo_orig if saldo_orig else 0.0
                 romaneios.append({
                     "De": from_g,
                     "Para": to_g,
@@ -188,6 +200,7 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
                     "Saldo Destino": int(saldo_por_garagem.get(to_g, 0)),
                     "Est. Máx Destino": int(estmax_por_garagem.get(to_g, 0)),
                     "Quantidade": int(transfer),
+                    "Valor Transferido": round(preco_unit * transfer, 2),
                     "age": age,
                     "pqr": pqr,
                 })
@@ -195,7 +208,10 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
                 surplus[from_g] = sobra_restante
                 deficit[to_g] = falta_restante - transfer
 
-    return pd.DataFrame(romaneios)
+    df = pd.DataFrame(romaneios)
+    if not df.empty:
+        df = df.sort_values("Valor Transferido", ascending=False).reset_index(drop=True)
+    return df
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -239,13 +255,14 @@ if st.button("Calcular Romaneios", type="primary"):
         if filtro_pqr:
             df_view = df_view[df_view["pqr"].isin(filtro_pqr)]
 
-        m1, m2, m3 = st.columns(3)
+        m1, m2, m3, m4 = st.columns(4)
         m1.metric("Total de transferências", len(df_view))
         m2.metric("Produtos afetados", df_view["Código"].nunique())
         m3.metric(
             "Garagens envolvidas",
             df_view[["De", "Para"]].stack().nunique() if not df_view.empty else 0,
         )
+        m4.metric("Valor total movimentado", f"R$ {df_view['Valor Transferido'].sum():,.2f}")
 
         st.divider()
 
@@ -263,5 +280,6 @@ if st.button("Calcular Romaneios", type="primary"):
                     "Saldo Destino": st.column_config.NumberColumn(format="%d"),
                     "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
                     "Quantidade": st.column_config.NumberColumn(format="%d"),
+                    "Valor Transferido": st.column_config.NumberColumn(format="R$ %.2f"),
                 },
             )
