@@ -228,72 +228,79 @@ st.caption("Distribui o excesso de estoque das garagens com sobra para as garage
 
 st.caption("Saldo e estoque máximo/mínimo são lidos automaticamente das planilhas Google publicadas.")
 
+# O botão apenas calcula e guarda em session_state. A renderização acontece fora
+# do bloco: st.button() só é True no rerun do clique, e mexer num filtro dispara
+# um novo rerun — sem isso a tabela sumiria a cada filtro aplicado.
 if st.button("Calcular Romaneios", type="primary"):
     with st.spinner("Processando..."):
         try:
             saldo_df = parse_saldo(load_saldo_raw())
             maxmin_df = parse_maxmin(load_maxmin_raw())
-            resultado = calcular_romaneios(saldo_df, maxmin_df)
+            st.session_state.resultado = calcular_romaneios(saldo_df, maxmin_df)
         except Exception as e:
             st.error(f"Erro ao processar os dados: {e}")
             st.stop()
 
-    if resultado.empty:
-        st.success("Nenhuma transferência necessária — todos os estoques estão dentro dos limites.")
+resultado = st.session_state.get("resultado")
+
+if resultado is None:
+    st.info("Clique em **Calcular Romaneios** para gerar as sugestões.")
+elif resultado.empty:
+    st.success("Nenhuma transferência necessária — todos os estoques estão dentro dos limites.")
+else:
+    f1, f2, f3, f4 = st.columns(4)
+    with f1:
+        filtro_de = st.multiselect("Origem (De)", sorted(resultado["De"].unique()))
+    with f2:
+        filtro_para = st.multiselect("Destino (Para)", sorted(resultado["Para"].unique()))
+    with f3:
+        filtro_age = st.multiselect("age", sorted(resultado["age"].unique()))
+    with f4:
+        filtro_pqr = st.multiselect("pqr", sorted(resultado["pqr"].unique()))
+
+    df_view = resultado.copy()
+    if filtro_de:
+        df_view = df_view[df_view["De"].isin(filtro_de)]
+    if filtro_para:
+        df_view = df_view[df_view["Para"].isin(filtro_para)]
+    if filtro_age:
+        df_view = df_view[df_view["age"].isin(filtro_age)]
+    if filtro_pqr:
+        df_view = df_view[df_view["pqr"].isin(filtro_pqr)]
+
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("Total de transferências", len(df_view))
+    m2.metric("Produtos afetados", df_view["Código"].nunique())
+    m3.metric(
+        "Garagens envolvidas",
+        df_view[["De", "Para"]].stack().nunique() if not df_view.empty else 0,
+    )
+    m4.metric("Valor total movimentado", formatar_brl(df_view["Valor Transferido"].sum()))
+
+    st.divider()
+
+    if df_view.empty:
+        st.info("Nenhum romaneio para os filtros selecionados.")
     else:
-        f1, f2, f3, f4 = st.columns(4)
-        with f1:
-            filtro_de = st.multiselect("Origem (De)", sorted(resultado["De"].unique()))
-        with f2:
-            filtro_para = st.multiselect("Destino (Para)", sorted(resultado["Para"].unique()))
-        with f3:
-            filtro_age = st.multiselect("age", sorted(resultado["age"].unique()))
-        with f4:
-            filtro_pqr = st.multiselect("pqr", sorted(resultado["pqr"].unique()))
-
-        df_view = resultado.copy()
-        if filtro_de:
-            df_view = df_view[df_view["De"].isin(filtro_de)]
-        if filtro_para:
-            df_view = df_view[df_view["Para"].isin(filtro_para)]
-        if filtro_age:
-            df_view = df_view[df_view["age"].isin(filtro_age)]
-        if filtro_pqr:
-            df_view = df_view[df_view["pqr"].isin(filtro_pqr)]
-
-        m1, m2, m3, m4 = st.columns(4)
-        m1.metric("Total de transferências", len(df_view))
-        m2.metric("Produtos afetados", df_view["Código"].nunique())
-        m3.metric(
-            "Garagens envolvidas",
-            df_view[["De", "Para"]].stack().nunique() if not df_view.empty else 0,
+        colunas_exibidas = [
+            "De", "Para", "Código", "Produto", "age",
+            "Saldo Origem", "Est. Máx Origem",
+            "Saldo Destino", "Est. Máx Destino",
+            "Quantidade", "Valor Transferido",
+        ]
+        st.dataframe(
+            df_view[colunas_exibidas],
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "Código": st.column_config.NumberColumn(format="%d"),
+                "Saldo Origem": st.column_config.NumberColumn(format="%d"),
+                "Est. Máx Origem": st.column_config.NumberColumn(format="%d"),
+                "Saldo Destino": st.column_config.NumberColumn(format="%d"),
+                "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
+                "Quantidade": st.column_config.NumberColumn(format="%d"),
+                "Valor Transferido": st.column_config.NumberColumn(
+                    "Valor Transferido (R$)", format="localized"
+                ),
+            },
         )
-        m4.metric("Valor total movimentado", formatar_brl(df_view["Valor Transferido"].sum()))
-
-        st.divider()
-
-        if df_view.empty:
-            st.info("Nenhum romaneio para os filtros selecionados.")
-        else:
-            colunas_exibidas = [
-                "De", "Para", "Código", "Produto", "age",
-                "Saldo Origem", "Est. Máx Origem",
-                "Saldo Destino", "Est. Máx Destino",
-                "Quantidade", "Valor Transferido",
-            ]
-            st.dataframe(
-                df_view[colunas_exibidas],
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "Código": st.column_config.NumberColumn(format="%d"),
-                    "Saldo Origem": st.column_config.NumberColumn(format="%d"),
-                    "Est. Máx Origem": st.column_config.NumberColumn(format="%d"),
-                    "Saldo Destino": st.column_config.NumberColumn(format="%d"),
-                    "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
-                    "Quantidade": st.column_config.NumberColumn(format="%d"),
-                    "Valor Transferido": st.column_config.NumberColumn(
-                        "Valor Transferido (R$)", format="localized"
-                    ),
-                },
-            )
