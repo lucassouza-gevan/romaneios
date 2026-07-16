@@ -150,42 +150,155 @@ def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
     return out[["garagem", "codigo", "est_max", "age", "pqr"]]
 
 
-def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.DataFrame:
+def _arredondar_maior_resto(alocacao: dict, total: int) -> dict:
+    """Converte alocações fracionárias em inteiros somando exatamente `total`,
+    distribuindo o resto pelas maiores partes fracionárias."""
+    base = {g: int(v) for g, v in alocacao.items()}
+    resto = total - sum(base.values())
+    if resto > 0:
+        por_fracao = sorted(alocacao, key=lambda g: alocacao[g] - int(alocacao[g]), reverse=True)
+        for g in por_fracao[:resto]:
+            base[g] += 1
+    return {g: v for g, v in base.items() if v > 0}
+
+
+def _distribuir_proporcional(total: int, destinos: dict) -> dict:
+    """Distribui `total` unidades entre `destinos` ({garagem: (saldo, est_max)},
+    est_max > 0) de forma que a ocupação final (saldo/máx) fique igual para todas.
+
+    Quem já está acima do alvo proporcional não recebe e sai do rateio (nunca
+    tiramos estoque de ninguém) — os demais reabsorvem o total. Pode estourar o
+    máximo do destino quando o estoque total supera a soma dos máximos.
+    """
+    elegiveis = dict(destinos)
+    alocacao = {g: 0.0 for g in destinos}
+
+    while elegiveis:
+        soma_max = sum(m for _, m in elegiveis.values())
+        if soma_max <= 0:
+            break
+        soma_saldo = sum(s for s, _ in elegiveis.values())
+        k = (soma_saldo + total) / soma_max
+        acima = [g for g, (s, m) in elegiveis.items() if k * m < s]
+        if not acima:
+            for g, (s, m) in elegiveis.items():
+                alocacao[g] = k * m - s
+            break
+        for g in acima:
+            elegiveis.pop(g)
+
+    return _arredondar_maior_resto(alocacao, total)
+
+
+def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame):
+    """Retorna (romaneios, itens_sem_destino).
+
+    Duas fases por produto:
+      (a) garagens com máx=0 e saldo>0 são esvaziadas, e o saldo é redistribuído
+          proporcionalmente ao máximo das demais (ocupação final igual);
+      (b) regra normal sobre os saldos já atualizados: sobra → falta, seguindo a
+          prioridade de GARAGE_ORDER.
+    Produtos com saldo em máx=0 e nenhuma garagem com máx>0 não têm destino
+    possível e vão para a lista `itens_sem_destino`.
+    """
     merged = saldo_df.merge(maxmin_df, on=["garagem", "codigo"], how="inner")
-
-    merged["sobra"] = (merged["saldo"] - merged["est_max"]).clip(lower=0)
-    merged["falta"] = (merged["est_max"] - merged["saldo"]).clip(lower=0)
-
-    # Only garages in our defined order
     merged = merged[merged["garagem"].isin(GARAGE_ORDER)]
 
     romaneios = []
+    sem_destino = []
 
     for product_code, group in merged.groupby("codigo"):
         descricao = group["descricao"].iloc[0]
         age = group["age"].iloc[0]
         pqr = group["pqr"].iloc[0]
-        saldo_por_garagem = group.set_index("garagem")["saldo"].to_dict()
-        estmax_por_garagem = group.set_index("garagem")["est_max"].to_dict()
-        valor_por_garagem = group.set_index("garagem")["valor"].to_dict()
 
-        surplus = (
-            group[group["sobra"] > 0]
-            .set_index("garagem")["sobra"]
-            .to_dict()
-        )
-        deficit = (
-            group[group["falta"] > 0]
-            .set_index("garagem")["falta"]
-            .to_dict()
-        )
+        saldo_orig = group.set_index("garagem")["saldo"].to_dict()
+        est_max = group.set_index("garagem")["est_max"].to_dict()
+        valor = group.set_index("garagem")["valor"].to_dict()
+
+        # Preço unitário a partir do estado original (valor total / saldo)
+        preco_unit = {
+            g: (valor.get(g, 0.0) / s if s else 0.0) for g, s in saldo_orig.items()
+        }
+
+        def registrar(de, para, qtd, regra):
+            romaneios.append({
+                "De": de,
+                "Para": para,
+                "Código": product_code,
+                "Produto": descricao,
+                "Saldo Origem": int(saldo_orig.get(de, 0)),
+                "Est. Máx Origem": int(est_max.get(de, 0)),
+                "Saldo Destino": int(saldo_orig.get(para, 0)),
+                "Est. Máx Destino": int(est_max.get(para, 0)),
+                "Quantidade": int(qtd),
+                "Valor Transferido": round(preco_unit.get(de, 0.0) * qtd, 2),
+                "age": age,
+                "pqr": pqr,
+                "regra": regra,
+            })
+
+        saldo_atual = dict(saldo_orig)
+
+        # ── (a) evacuação das garagens com máx = 0 ──────────────────────────
+        origens_zero = {
+            g: s for g, s in saldo_atual.items() if est_max.get(g, 0) == 0 and s > 0
+        }
+        # Lista (não set) e na ordem canônica: a ordem influencia o desempate do
+        # arredondamento, e um set daria resultados diferentes a cada execução.
+        destinos_validos = [
+            g for g in GARAGE_ORDER if g in saldo_atual and est_max.get(g, 0) > 0
+        ]
+
+        if origens_zero and not destinos_validos:
+            for g, s in origens_zero.items():
+                sem_destino.append({
+                    "Código": product_code,
+                    "Produto": descricao,
+                    "Garagem": g,
+                    "Saldo": int(s),
+                    "Valor em Estoque": round(valor.get(g, 0.0), 2),
+                    "age": age,
+                    "pqr": pqr,
+                })
+        elif origens_zero:
+            total_evacuar = int(sum(origens_zero.values()))
+            destinos = {g: (saldo_atual[g], est_max[g]) for g in destinos_validos}
+            alocacao = _distribuir_proporcional(total_evacuar, destinos)
+
+            for orig in [g for g in GARAGE_ORDER if g in origens_zero]:
+                restante = int(origens_zero[orig])
+                for dest in [g for g in GARAGE_ORDER if g in alocacao]:
+                    if restante <= 0:
+                        break
+                    qtd = min(restante, alocacao[dest])
+                    if qtd <= 0:
+                        continue
+                    registrar(orig, dest, qtd, "evacuacao")
+                    alocacao[dest] -= qtd
+                    restante -= qtd
+                    saldo_atual[dest] += qtd
+                saldo_atual[orig] = restante
+
+        # ── (b) regra normal: sobra → falta, com os saldos já atualizados ───
+        surplus = {
+            g: saldo_atual[g] - est_max[g]
+            for g in saldo_atual
+            if est_max.get(g, 0) > 0 and saldo_atual[g] > est_max[g]
+        }
+        deficit = {
+            g: est_max[g] - saldo_atual[g]
+            for g in saldo_atual
+            if est_max.get(g, 0) > 0 and saldo_atual[g] < est_max[g]
+        }
 
         if not surplus or not deficit:
             continue
 
         deficit_ordered = [g for g in GARAGE_ORDER if g in deficit]
 
-        for from_g, sobra_restante in list(surplus.items()):
+        for from_g in [g for g in GARAGE_ORDER if g in surplus]:
+            sobra_restante = surplus[from_g]
             for to_g in deficit_ordered:
                 if to_g == from_g or sobra_restante <= 0:
                     continue
@@ -193,23 +306,7 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
                 if falta_restante <= 0:
                     continue
                 transfer = min(sobra_restante, falta_restante)
-                # Preço unitário derivado da origem (valor total / saldo)
-                saldo_orig = saldo_por_garagem.get(from_g, 0)
-                preco_unit = valor_por_garagem.get(from_g, 0.0) / saldo_orig if saldo_orig else 0.0
-                romaneios.append({
-                    "De": from_g,
-                    "Para": to_g,
-                    "Código": product_code,
-                    "Produto": descricao,
-                    "Saldo Origem": int(saldo_por_garagem.get(from_g, 0)),
-                    "Est. Máx Origem": int(estmax_por_garagem.get(from_g, 0)),
-                    "Saldo Destino": int(saldo_por_garagem.get(to_g, 0)),
-                    "Est. Máx Destino": int(estmax_por_garagem.get(to_g, 0)),
-                    "Quantidade": int(transfer),
-                    "Valor Transferido": round(preco_unit * transfer, 2),
-                    "age": age,
-                    "pqr": pqr,
-                })
+                registrar(from_g, to_g, transfer, "normal")
                 sobra_restante -= transfer
                 surplus[from_g] = sobra_restante
                 deficit[to_g] = falta_restante - transfer
@@ -217,7 +314,7 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame) -> pd.Da
     df = pd.DataFrame(romaneios)
     if not df.empty:
         df = df.sort_values("Valor Transferido", ascending=False).reset_index(drop=True)
-    return df
+    return df, pd.DataFrame(sem_destino)
 
 
 # ── UI ────────────────────────────────────────────────────────────────────────
@@ -236,27 +333,61 @@ if st.button("Calcular Romaneios", type="primary"):
         try:
             saldo_df = parse_saldo(load_saldo_raw())
             maxmin_df = parse_maxmin(load_maxmin_raw())
-            st.session_state.resultado = calcular_romaneios(saldo_df, maxmin_df)
+            resultado, sem_destino = calcular_romaneios(saldo_df, maxmin_df)
+            st.session_state.resultado = resultado
+            st.session_state.sem_destino = sem_destino
         except Exception as e:
             st.error(f"Erro ao processar os dados: {e}")
             st.stop()
 
 resultado = st.session_state.get("resultado")
+sem_destino = st.session_state.get("sem_destino")
 
-if resultado is None:
-    st.info("Clique em **Calcular Romaneios** para gerar as sugestões.")
-elif resultado.empty:
-    st.success("Nenhuma transferência necessária — todos os estoques estão dentro dos limites.")
-else:
+if sem_destino is None:
+    sem_destino = pd.DataFrame()
+
+def render_sem_destino(sem_destino: pd.DataFrame) -> None:
+    st.caption(
+        "Itens com saldo em garagens cujo estoque máximo é 0, mas sem nenhuma "
+        "garagem com máximo > 0 para recebê-los — não há para onde transferir."
+    )
+    if sem_destino.empty:
+        st.success("Nenhum item sem destino.")
+        return
+
+    s1, s2 = st.columns(2)
+    s1.metric("Itens sem destino", len(sem_destino))
+    s2.metric("Valor parado", formatar_brl(sem_destino["Valor em Estoque"].sum()))
+    st.dataframe(
+        sem_destino.drop(columns=["pqr"]),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "Código": st.column_config.NumberColumn(format="%d"),
+            "Saldo": st.column_config.NumberColumn(format="%d"),
+            "Valor em Estoque": st.column_config.NumberColumn(
+                "Valor em Estoque (R$)", format="localized"
+            ),
+        },
+    )
+
+
+def render_romaneios(resultado: pd.DataFrame, chave: str, msg_vazio: str) -> None:
+    """`chave` prefixa os widgets: a mesma função roda em duas abas e o Streamlit
+    exige IDs únicos por widget."""
+    if resultado.empty:
+        st.success(msg_vazio)
+        return
+
     f1, f2, f3, f4 = st.columns(4)
     with f1:
-        filtro_de = st.multiselect("Origem (De)", sorted(resultado["De"].unique()))
+        filtro_de = st.multiselect("Origem (De)", sorted(resultado["De"].unique()), key=f"{chave}_de")
     with f2:
-        filtro_para = st.multiselect("Destino (Para)", sorted(resultado["Para"].unique()))
+        filtro_para = st.multiselect("Destino (Para)", sorted(resultado["Para"].unique()), key=f"{chave}_para")
     with f3:
-        filtro_age = st.multiselect("age", sorted(resultado["age"].unique()))
+        filtro_age = st.multiselect("age", sorted(resultado["age"].unique()), key=f"{chave}_age")
     with f4:
-        filtro_pqr = st.multiselect("pqr", sorted(resultado["pqr"].unique()))
+        filtro_pqr = st.multiselect("pqr", sorted(resultado["pqr"].unique()), key=f"{chave}_pqr")
 
     df_view = resultado.copy()
     if filtro_de:
@@ -304,3 +435,44 @@ else:
                 ),
             },
         )
+
+
+if resultado is None:
+    st.info("Clique em **Calcular Romaneios** para gerar as sugestões.")
+else:
+    if resultado.empty:
+        rom_normal = rom_evacuacao = resultado
+    else:
+        rom_normal = resultado[resultado["regra"] == "normal"]
+        rom_evacuacao = resultado[resultado["regra"] == "evacuacao"]
+
+    aba_normal, aba_evacuacao, aba_sem_destino = st.tabs([
+        f"Romaneios ({len(rom_normal)})",
+        f"Distribuição máx=0 ({len(rom_evacuacao)})",
+        f"Itens sem destino ({len(sem_destino)})",
+    ])
+
+    with aba_normal:
+        st.caption(
+            "Transferências da regra padrão: garagens com saldo acima do máximo "
+            "abastecem as que estão abaixo, na prioridade G1 → G2 → G5 → G6 → G7 → SS."
+        )
+        render_romaneios(
+            rom_normal,
+            "normal",
+            "Nenhuma transferência necessária — todos os estoques estão dentro dos limites.",
+        )
+
+    with aba_evacuacao:
+        st.caption(
+            "Garagens cujo estoque máximo é 0 mas têm saldo: todo o saldo é evacuado e "
+            "redistribuído entre as demais, proporcionalmente ao estoque máximo de cada uma."
+        )
+        render_romaneios(
+            rom_evacuacao,
+            "evacuacao",
+            "Nenhuma garagem com estoque máximo zerado e saldo em estoque.",
+        )
+
+    with aba_sem_destino:
+        render_sem_destino(sem_destino)
