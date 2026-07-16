@@ -24,6 +24,12 @@ def _to_csv_url(url: str) -> str:
     return url
 
 
+def formatar_brl(valor: float) -> str:
+    """1234567.5 → 'R$ 1.234.567,50' (separadores no padrão brasileiro)."""
+    inteiro, decimal = f"{valor:,.2f}".split(".")
+    return f"R$ {inteiro.replace(',', '.')},{decimal}"
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_saldo_raw() -> pd.DataFrame:
     """Lê a aba publicada da planilha Google (CSV) de st.secrets['saldo_unid_url']."""
@@ -262,15 +268,21 @@ if st.button("Calcular Romaneios", type="primary"):
             "Garagens envolvidas",
             df_view[["De", "Para"]].stack().nunique() if not df_view.empty else 0,
         )
-        m4.metric("Valor total movimentado", f"R$ {df_view['Valor Transferido'].sum():,.2f}")
+        m4.metric("Valor total movimentado", formatar_brl(df_view["Valor Transferido"].sum()))
 
         st.divider()
 
         if df_view.empty:
             st.info("Nenhum romaneio para os filtros selecionados.")
         else:
+            colunas_exibidas = [
+                "De", "Para", "Código", "Produto", "age",
+                "Saldo Origem", "Est. Máx Origem",
+                "Saldo Destino", "Est. Máx Destino",
+                "Quantidade", "Valor Transferido",
+            ]
             st.dataframe(
-                df_view.drop(columns=["age", "pqr"]),
+                df_view[colunas_exibidas],
                 use_container_width=True,
                 hide_index=True,
                 column_config={
@@ -280,6 +292,8 @@ if st.button("Calcular Romaneios", type="primary"):
                     "Saldo Destino": st.column_config.NumberColumn(format="%d"),
                     "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
                     "Quantidade": st.column_config.NumberColumn(format="%d"),
-                    "Valor Transferido": st.column_config.NumberColumn(format="R$ %.2f"),
+                    "Valor Transferido": st.column_config.NumberColumn(
+                        "Valor Transferido (R$)", format="localized"
+                    ),
                 },
             )
