@@ -150,6 +150,69 @@ def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
     return out[["garagem", "codigo", "est_max", "age", "pqr"]]
 
 
+@st.cache_data(ttl=300, show_spinner=False)
+def load_consumo_raw() -> pd.DataFrame:
+    """Lê a aba publicada de consumo 3m/6m (CSV) de st.secrets['consumo_url']."""
+    try:
+        url = st.secrets["consumo_url"]
+    except (KeyError, FileNotFoundError):
+        raise RuntimeError(
+            "Secret 'consumo_url' não encontrado. Defina a URL da planilha "
+            "Google publicada nos secrets do Streamlit."
+        )
+    return pd.read_csv(_to_csv_url(url), header=None, dtype=str)
+
+
+def parse_consumo(df_raw: pd.DataFrame) -> pd.DataFrame:
+    """Aba com blocos lado a lado: linha 1 traz o título do bloco ("consumo 06
+    meses", "consumo 03 meses") e linha 2 os cabeçalhos (código, produto, G1…SS).
+    Cada bloco vai da coluna do título até o início do próximo. Retorna formato
+    long: garagem, codigo, c3m, c6m."""
+    titulos = df_raw.iloc[0].fillna("").astype(str).str.strip()
+    cabecalhos = df_raw.iloc[1].fillna("").astype(str).str.strip()
+    dados = df_raw.iloc[2:]
+
+    inicios = []
+    for i, t in enumerate(titulos):
+        m = re.search(r"consumo\s*0*(\d+)\s*mes", t, re.IGNORECASE)
+        if m:
+            inicios.append((i, f"c{int(m.group(1))}m"))
+
+    blocos = []
+    for n, (ini, nome) in enumerate(inicios):
+        fim = inicios[n + 1][0] if n + 1 < len(inicios) else len(cabecalhos)
+        col_codigo = next(
+            (c for c in range(ini, fim) if cabecalhos[c].lower() in ("código", "codigo")),
+            None,
+        )
+        if col_codigo is None:
+            continue
+        codigo = pd.to_numeric(dados.iloc[:, col_codigo], errors="coerce")
+        for c in range(ini, fim):
+            g = normalize_garage(cabecalhos[c])
+            if g not in GARAGE_ORDER:
+                continue
+            qtd = pd.to_numeric(
+                dados.iloc[:, c].fillna("").str.replace(",", "."), errors="coerce"
+            ).fillna(0)
+            blocos.append(pd.DataFrame({
+                "garagem": g, "codigo": codigo, "periodo": nome, "qtd": qtd,
+            }))
+
+    if not blocos:
+        return pd.DataFrame(columns=["garagem", "codigo", "c3m", "c6m"])
+
+    out = pd.concat(blocos, ignore_index=True).dropna(subset=["codigo"])
+    out["codigo"] = out["codigo"].astype(int)
+    out = out.pivot_table(
+        index=["garagem", "codigo"], columns="periodo", values="qtd", aggfunc="sum"
+    ).reset_index()
+    for col in ("c3m", "c6m"):
+        if col not in out.columns:
+            out[col] = 0.0
+    return out[["garagem", "codigo", "c3m", "c6m"]].fillna(0)
+
+
 def _arredondar_maior_resto(alocacao: dict, total: int) -> dict:
     """Converte alocações fracionárias em inteiros somando exatamente `total`,
     distribuindo o resto pelas maiores partes fracionárias."""
@@ -190,7 +253,7 @@ def _distribuir_proporcional(total: int, destinos: dict) -> dict:
     return _arredondar_maior_resto(alocacao, total)
 
 
-def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame):
+def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_df: pd.DataFrame):
     """Retorna (romaneios, itens_sem_destino).
 
     Duas fases por produto:
@@ -203,6 +266,12 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame):
     """
     merged = saldo_df.merge(maxmin_df, on=["garagem", "codigo"], how="inner")
     merged = merged[merged["garagem"].isin(GARAGE_ORDER)]
+
+    # (garagem, codigo) → (c3m, c6m); ausente na aba de consumo = 0
+    consumo = {
+        (g, c): (c3, c6)
+        for g, c, c3, c6 in consumo_df[["garagem", "codigo", "c3m", "c6m"]].itertuples(index=False)
+    }
 
     romaneios = []
     sem_destino = []
@@ -222,6 +291,7 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame):
         }
 
         def registrar(de, para, qtd, regra):
+            c3m, c6m = consumo.get((de, product_code), (0, 0))
             romaneios.append({
                 "De": de,
                 "Para": para,
@@ -229,6 +299,8 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame):
                 "Produto": descricao,
                 "Saldo Origem": int(saldo_orig.get(de, 0)),
                 "Est. Máx Origem": int(est_max.get(de, 0)),
+                "c3m": int(c3m),
+                "c6m": int(c6m),
                 "Saldo Destino": int(saldo_orig.get(para, 0)),
                 "Est. Máx Destino": int(est_max.get(para, 0)),
                 "Quantidade": int(qtd),
@@ -333,7 +405,8 @@ if st.button("Calcular Romaneios", type="primary"):
         try:
             saldo_df = parse_saldo(load_saldo_raw())
             maxmin_df = parse_maxmin(load_maxmin_raw())
-            resultado, sem_destino = calcular_romaneios(saldo_df, maxmin_df)
+            consumo_df = parse_consumo(load_consumo_raw())
+            resultado, sem_destino = calcular_romaneios(saldo_df, maxmin_df, consumo_df)
             st.session_state.resultado = resultado
             st.session_state.sem_destino = sem_destino
         except Exception as e:
@@ -413,25 +486,43 @@ def render_romaneios(resultado: pd.DataFrame, chave: str, msg_vazio: str) -> Non
     if df_view.empty:
         st.info("Nenhum romaneio para os filtros selecionados.")
     else:
-        colunas_exibidas = [
-            "De", "Para", "Código", "Produto", "age",
-            "Saldo Origem", "Est. Máx Origem",
-            "Saldo Destino", "Est. Máx Destino",
-            "Quantidade", "Valor Transferido",
-        ]
+        # Nome interno → cabeçalho exibido (na ordem da tabela). Os nomes internos
+        # seguem em uso nos filtros e métricas; só a exibição é renomeada.
+        cabecalhos = {
+            "De": "de",
+            "Para": "para",
+            "Código": "código",
+            "Produto": "produto",
+            "age": "AGE",
+            "Saldo Origem": "sld orig",
+            "Est. Máx Origem": "máx orig",
+            "c3m": "c3m",
+            "c6m": "c6m",
+            "Saldo Destino": "sld dest",
+            "Est. Máx Destino": "máx dest",
+            "Quantidade": "qtde",
+            "Valor Transferido": "valor",
+        }
+        inteiro = st.column_config.NumberColumn(format="%d")
         st.dataframe(
-            df_view[colunas_exibidas],
+            df_view[list(cabecalhos)].rename(columns=cabecalhos),
             use_container_width=True,
             hide_index=True,
             column_config={
-                "Código": st.column_config.NumberColumn(format="%d"),
-                "Saldo Origem": st.column_config.NumberColumn(format="%d"),
-                "Est. Máx Origem": st.column_config.NumberColumn(format="%d"),
-                "Saldo Destino": st.column_config.NumberColumn(format="%d"),
-                "Est. Máx Destino": st.column_config.NumberColumn(format="%d"),
-                "Quantidade": st.column_config.NumberColumn(format="%d"),
-                "Valor Transferido": st.column_config.NumberColumn(
-                    "Valor Transferido (R$)", format="localized"
+                "código": inteiro,
+                "sld orig": inteiro,
+                "máx orig": inteiro,
+                "c3m": st.column_config.NumberColumn(
+                    format="%d", help="Consumo da garagem de origem nos últimos 3 meses"
+                ),
+                "c6m": st.column_config.NumberColumn(
+                    format="%d", help="Consumo da garagem de origem nos últimos 6 meses"
+                ),
+                "sld dest": inteiro,
+                "máx dest": inteiro,
+                "qtde": inteiro,
+                "valor": st.column_config.NumberColumn(
+                    format="localized", help="Valor transferido (R$)"
                 ),
             },
         )
