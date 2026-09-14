@@ -521,8 +521,9 @@ def render_romaneios(resultado: pd.DataFrame, chave: str, msg_vazio: str) -> Non
                 "sld dest": inteiro,
                 "máx dest": inteiro,
                 "qtde": inteiro,
+                # step=0.1 fixa 1 casa decimal no formato localized
                 "valor": st.column_config.NumberColumn(
-                    format="localized", help="Valor transferido (R$)"
+                    format="localized", step=0.1, help="Valor transferido (R$)"
                 ),
             },
         )
