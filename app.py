@@ -274,8 +274,14 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_
     Produtos com saldo em máx=0 e nenhuma garagem com máx>0 não têm destino
     possível e vão para a lista `itens_sem_destino`.
     """
-    merged = saldo_df.merge(maxmin_df, on=["garagem", "codigo"], how="inner")
-    merged = merged[merged["garagem"].isin(GARAGE_ORDER)]
+    # Parte do máx/mín: o relatório de saldo omite garagens com estoque zerado, e
+    # com um inner join elas sumiam do cálculo e nunca recebiam romaneio. Ficam
+    # só os produtos com saldo em alguma garagem — sem saldo não há o que mover.
+    merged = maxmin_df.merge(saldo_df, on=["garagem", "codigo"], how="left")
+    merged = merged[
+        merged["garagem"].isin(GARAGE_ORDER) & merged["codigo"].isin(saldo_df["codigo"])
+    ]
+    merged[["saldo", "valor"]] = merged[["saldo", "valor"]].fillna(0.0)
 
     # (garagem, codigo) → (c3m, c6m); ausente na aba de consumo = 0
     consumo = {
@@ -287,7 +293,8 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_
     sem_destino = []
 
     for product_code, group in merged.groupby("codigo"):
-        descricao = group["descricao"].iloc[0]
+        # Garagens incluídas com saldo 0 não têm descrição (vem do relatório de saldo)
+        descricao = group["descricao"].dropna().iloc[0]
         age = group["age"].iloc[0]
         pqr = group["pqr"].iloc[0]
 
