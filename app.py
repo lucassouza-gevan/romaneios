@@ -299,6 +299,9 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_
                 "Produto": descricao,
                 "Saldo Origem": int(saldo_orig.get(de, 0)),
                 "Est. Máx Origem": int(est_max.get(de, 0)),
+                # Dias de estoque da origem: saldo / consumo diário médio de 6m
+                # (180 dias). Sem consumo não há DDE — fica vazio.
+                "DDE": round(saldo_orig.get(de, 0) / (c6m / 180)) if c6m > 0 else None,
                 "c3m": int(c3m),
                 "c6m": int(c6m),
                 "Saldo Destino": int(saldo_orig.get(para, 0)),
@@ -496,6 +499,7 @@ def render_romaneios(resultado: pd.DataFrame, chave: str, msg_vazio: str) -> Non
             "age": "AGE",
             "Saldo Origem": "sld orig",
             "Est. Máx Origem": "máx orig",
+            "DDE": "DDE",
             "c3m": "c3m",
             "c6m": "c6m",
             "Saldo Destino": "sld dest",
@@ -512,6 +516,11 @@ def render_romaneios(resultado: pd.DataFrame, chave: str, msg_vazio: str) -> Non
                 "código": inteiro,
                 "sld orig": inteiro,
                 "máx orig": inteiro,
+                "DDE": st.column_config.NumberColumn(
+                    format="%d",
+                    help="Dias de estoque da origem (saldo ÷ consumo diário de 6 meses). "
+                    "Vazio = sem consumo em 6 meses",
+                ),
                 "c3m": st.column_config.NumberColumn(
                     format="%d", help="Consumo da garagem de origem nos últimos 3 meses"
                 ),
