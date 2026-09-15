@@ -4,6 +4,10 @@ import re
 
 GARAGE_ORDER = ["G1", "G2", "G5", "G6", "G7", "SS"]
 
+# AGEs fora da aba Romaneios por padrão (checkbox reinclui)
+AGE_FORA_ROMANEIOS = ("SET", "ORD", "LPZ")
+CORTES_DDE = ["Todos", "> 15", "> 30", "> 90", "> 180"]
+
 
 def normalize_garage(name: str) -> str:
     name = str(name).strip()
@@ -465,12 +469,47 @@ def render_sem_destino(sem_destino: pd.DataFrame) -> None:
     )
 
 
-def render_romaneios(resultado: pd.DataFrame, chave: str, msg_vazio: str) -> None:
+def _sem_age_fora(df: pd.DataFrame, age_fora: tuple) -> pd.DataFrame:
+    if df.empty or not age_fora:
+        return df
+    return df[~df["age"].str.strip().str.upper().isin(age_fora)]
+
+
+def render_romaneios(
+    resultado: pd.DataFrame,
+    chave: str,
+    msg_vazio: str,
+    age_fora: tuple = (),
+    filtro_dde: bool = False,
+) -> None:
     """`chave` prefixa os widgets: a mesma função roda em duas abas e o Streamlit
-    exige IDs únicos por widget."""
+    exige IDs únicos por widget. `age_fora` esconde essas AGEs por padrão (com
+    checkbox para reincluir); `filtro_dde` mostra o corte por DDE da origem."""
     if resultado.empty:
         st.success(msg_vazio)
         return
+
+    corte_dde = "Todos"
+    if age_fora or filtro_dde:
+        c1, c2 = st.columns([1, 2])
+        if age_fora:
+            with c1:
+                todas_age = st.checkbox(
+                    "Incluir todas as AGE",
+                    key=f"{chave}_todas_age",
+                    help=f"Por padrão ficam fora: {', '.join(age_fora)}",
+                )
+            if not todas_age:
+                resultado = _sem_age_fora(resultado, age_fora)
+        if filtro_dde:
+            with c2:
+                corte_dde = st.radio(
+                    "DDE da origem",
+                    CORTES_DDE,
+                    horizontal=True,
+                    key=f"{chave}_dde",
+                    help="Itens sem consumo em 6 meses (DDE vazio) entram em qualquer corte",
+                )
 
     f1, f2, f3, f4 = st.columns(4)
     with f1:
@@ -491,6 +530,10 @@ def render_romaneios(resultado: pd.DataFrame, chave: str, msg_vazio: str) -> Non
         df_view = df_view[df_view["age"].isin(filtro_age)]
     if filtro_pqr:
         df_view = df_view[df_view["pqr"].isin(filtro_pqr)]
+    if corte_dde != "Todos":
+        dias = int(corte_dde.lstrip("> "))
+        # DDE vazio = sem consumo em 6 meses: o estoque não gira, passa em qualquer corte
+        df_view = df_view[df_view["DDE"].isna() | (df_view["DDE"] > dias)]
 
     m1, m2, m3, m4 = st.columns(4)
     m1.metric("Total de transferências", len(df_view))
@@ -564,8 +607,15 @@ else:
         rom_normal = resultado[resultado["regra"] == "normal"]
         rom_evacuacao = resultado[resultado["regra"] == "evacuacao"]
 
+    # O checkbox fica dentro da aba, mas o rótulo é montado antes: lê o estado
+    # do widget (persistido em session_state) para a contagem bater com a tabela.
+    if st.session_state.get("normal_todas_age", False):
+        qtd_normal = len(rom_normal)
+    else:
+        qtd_normal = len(_sem_age_fora(rom_normal, AGE_FORA_ROMANEIOS))
+
     aba_normal, aba_evacuacao, aba_sem_destino = st.tabs([
-        f"Romaneios ({len(rom_normal)})",
+        f"Romaneios ({qtd_normal})",
         f"Distribuição máx=0 ({len(rom_evacuacao)})",
         f"Itens sem destino ({len(sem_destino)})",
     ])
@@ -579,6 +629,8 @@ else:
             rom_normal,
             "normal",
             "Nenhuma transferência necessária — todos os estoques estão dentro dos limites.",
+            age_fora=AGE_FORA_ROMANEIOS,
+            filtro_dde=True,
         )
 
     with aba_evacuacao:
