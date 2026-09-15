@@ -30,6 +30,26 @@ def formatar_brl(valor: float) -> str:
     return f"R$ {inteiro.replace(',', '.')},{decimal}"
 
 
+# O CSV publicado sai no formato pt-BR da planilha: "." separa milhar e ","
+# separa decimal ("2.930" = 2930; "1.234,56" = 1234.56). Ler "2.930" como
+# float direto dá 2,93 — foi o que zerava consumos/saldos/máximos >= 1000.
+def _numero_br(serie: pd.Series) -> pd.Series:
+    texto = (
+        serie.fillna("").astype(str).str.strip()
+        .str.replace(".", "", regex=False)
+        .str.replace(",", ".", regex=False)
+    )
+    return pd.to_numeric(texto, errors="coerce")
+
+
+def _float_br(texto: str) -> float:
+    """Versão escalar de _numero_br (usada linha a linha no parse do saldo)."""
+    try:
+        return float(str(texto).strip().replace(".", "").replace(",", "."))
+    except ValueError:
+        return 0.0
+
+
 @st.cache_data(ttl=300, show_spinner=False)
 def load_saldo_raw() -> pd.DataFrame:
     """Lê a aba publicada da planilha Google (CSV) de st.secrets['saldo_unid_url']."""
@@ -70,18 +90,10 @@ def parse_saldo(df_raw: pd.DataFrame) -> pd.DataFrame:
         description = row_vals[2] if len(row_vals) > 2 else ""
 
         # Quantity in stock is column index 10
-        try:
-            qty_raw = row_vals[10] if len(row_vals) > 10 else ""
-            qty = float(qty_raw.replace(",", ".")) if qty_raw else 0.0
-        except ValueError:
-            qty = 0.0
+        qty = _float_br(row_vals[10]) if len(row_vals) > 10 else 0.0
 
         # Total stock value (col L, index 11)
-        try:
-            valor_raw = row_vals[11] if len(row_vals) > 11 else ""
-            valor = float(valor_raw.replace(",", ".")) if valor_raw else 0.0
-        except ValueError:
-            valor = 0.0
+        valor = _float_br(row_vals[11]) if len(row_vals) > 11 else 0.0
 
         rows.append({
             "garagem": current_garage,
@@ -115,7 +127,7 @@ def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
     df.columns = [str(c).strip() for c in df.columns]
 
-    codigo = pd.to_numeric(df.iloc[:, 0], errors="coerce")
+    codigo = _numero_br(df.iloc[:, 0])
 
     def coluna_meta(nome: str) -> pd.Series:
         for c in df.columns:
@@ -137,7 +149,7 @@ def parse_maxmin(df: pd.DataFrame) -> pd.DataFrame:
         pd.DataFrame({
             "garagem": g,
             "codigo": codigo,
-            "est_max": pd.to_numeric(df[col], errors="coerce").fillna(0),
+            "est_max": _numero_br(df[col]).fillna(0),
             "age": age,
             "pqr": pqr,
         })
@@ -187,14 +199,12 @@ def parse_consumo(df_raw: pd.DataFrame) -> pd.DataFrame:
         )
         if col_codigo is None:
             continue
-        codigo = pd.to_numeric(dados.iloc[:, col_codigo], errors="coerce")
+        codigo = _numero_br(dados.iloc[:, col_codigo])
         for c in range(ini, fim):
             g = normalize_garage(cabecalhos[c])
             if g not in GARAGE_ORDER:
                 continue
-            qtd = pd.to_numeric(
-                dados.iloc[:, c].fillna("").str.replace(",", "."), errors="coerce"
-            ).fillna(0)
+            qtd = _numero_br(dados.iloc[:, c]).fillna(0)
             blocos.append(pd.DataFrame({
                 "garagem": g, "codigo": codigo, "periodo": nome, "qtd": qtd,
             }))
