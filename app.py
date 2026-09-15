@@ -4,7 +4,7 @@ import re
 
 GARAGE_ORDER = ["G1", "G2", "G5", "G6", "G7", "SS"]
 
-# AGEs fora da aba Romaneios por padrão (checkbox reinclui)
+# AGEs fora das abas Romaneios e Distribuição máx=0 por padrão (checkbox reinclui)
 AGE_FORA_ROMANEIOS = ("SET", "ORD", "LPZ")
 CORTES_DDE = ["Todos", "> 30", "> 45", "> 60", "> 75", "> 90", "> 180"]
 
@@ -455,15 +455,25 @@ def render_sem_destino(sem_destino: pd.DataFrame) -> None:
     s1, s2 = st.columns(2)
     s1.metric("Itens sem destino", len(sem_destino))
     s2.metric("Valor parado", formatar_brl(sem_destino["Valor em Estoque"].sum()))
+    # Mesmo padrão de cabeçalhos curtos da tabela de romaneios
+    cabecalhos = {
+        "Código": "código",
+        "Produto": "produto",
+        "age": "AGE",
+        "Garagem": "garagem",
+        "Saldo": "sld",
+        "Valor em Estoque": "valor",
+    }
     st.dataframe(
-        sem_destino.drop(columns=["pqr"]),
+        sem_destino[list(cabecalhos)].rename(columns=cabecalhos),
         use_container_width=True,
         hide_index=True,
         column_config={
-            "Código": st.column_config.NumberColumn(format="%d"),
-            "Saldo": st.column_config.NumberColumn(format="%d"),
-            "Valor em Estoque": st.column_config.NumberColumn(
-                "Valor em Estoque (R$)", format="localized"
+            "código": st.column_config.NumberColumn(format="%d"),
+            "sld": st.column_config.NumberColumn(format="%d"),
+            # step=0.1 fixa 1 casa decimal no formato localized
+            "valor": st.column_config.NumberColumn(
+                format="localized", step=0.1, help="Valor em estoque (R$)"
             ),
         },
     )
@@ -609,14 +619,14 @@ else:
 
     # O checkbox fica dentro da aba, mas o rótulo é montado antes: lê o estado
     # do widget (persistido em session_state) para a contagem bater com a tabela.
-    if st.session_state.get("normal_todas_age", False):
-        qtd_normal = len(rom_normal)
-    else:
-        qtd_normal = len(_sem_age_fora(rom_normal, AGE_FORA_ROMANEIOS))
+    def qtd_aba(df: pd.DataFrame, chave: str) -> int:
+        if st.session_state.get(f"{chave}_todas_age", False):
+            return len(df)
+        return len(_sem_age_fora(df, AGE_FORA_ROMANEIOS))
 
     aba_normal, aba_evacuacao, aba_sem_destino = st.tabs([
-        f"Romaneios ({qtd_normal})",
-        f"Distribuição máx=0 ({len(rom_evacuacao)})",
+        f"Romaneios ({qtd_aba(rom_normal, 'normal')})",
+        f"Distribuição máx=0 ({qtd_aba(rom_evacuacao, 'evacuacao')})",
         f"Itens sem destino ({len(sem_destino)})",
     ])
 
@@ -642,6 +652,8 @@ else:
             rom_evacuacao,
             "evacuacao",
             "Nenhuma garagem com estoque máximo zerado e saldo em estoque.",
+            age_fora=AGE_FORA_ROMANEIOS,
+            filtro_dde=True,
         )
 
     with aba_sem_destino:
