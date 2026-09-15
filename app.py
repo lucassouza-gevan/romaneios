@@ -6,7 +6,7 @@ GARAGE_ORDER = ["G1", "G2", "G5", "G6", "G7", "SS"]
 
 # AGEs fora da aba Romaneios por padrão (checkbox reinclui)
 AGE_FORA_ROMANEIOS = ("SET", "ORD", "LPZ")
-CORTES_DDE = ["Todos", "> 15", "> 30", "> 90", "> 180"]
+CORTES_DDE = ["Todos", "> 30", "> 45", "> 60", "> 75", "> 90", "> 180"]
 
 
 def normalize_garage(name: str) -> str:
