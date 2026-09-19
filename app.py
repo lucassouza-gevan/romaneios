@@ -416,32 +416,32 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_
 # ── UI ────────────────────────────────────────────────────────────────────────
 
 st.set_page_config(page_title="Romaneios entre Garagens", layout="wide")
-st.title("Sugestão de Romaneios entre Garagens")
-st.caption("Distribui o excesso de estoque das garagens com sobra para as garagens com déficit, priorizando G1 → G2 → G5 → G6 → G7 → SS.")
+# Menos espaço acima do título (o padrão do Streamlit é ~6rem)
+st.markdown(
+    "<style>[data-testid='stMainBlockContainer'], .block-container "
+    "{padding-top: 2rem;}</style>",
+    unsafe_allow_html=True,
+)
+st.subheader("Sugestão de Romaneios entre Garagens")
 
-st.caption("Saldo e estoque máximo/mínimo são lidos automaticamente das planilhas Google publicadas.")
 
-# O botão apenas calcula e guarda em session_state. A renderização acontece fora
-# do bloco: st.button() só é True no rerun do clique, e mexer num filtro dispara
-# um novo rerun — sem isso a tabela sumiria a cada filtro aplicado.
-if st.button("Calcular Romaneios", type="primary"):
-    with st.spinner("Processando..."):
-        try:
-            saldo_df = parse_saldo(load_saldo_raw())
-            maxmin_df = parse_maxmin(load_maxmin_raw())
-            consumo_df = parse_consumo(load_consumo_raw())
-            resultado, sem_destino = calcular_romaneios(saldo_df, maxmin_df, consumo_df)
-            st.session_state.resultado = resultado
-            st.session_state.sem_destino = sem_destino
-        except Exception as e:
-            st.error(f"Erro ao processar os dados: {e}")
-            st.stop()
+@st.cache_data(ttl=300, show_spinner=False)
+def carregar_romaneios():
+    """Lê as planilhas e calcula ao abrir a página. Mesmo cache de 5 min das
+    leituras: mexer em filtros (cada um dispara um rerun) ou recarregar a página
+    dentro desse prazo reaproveita o cálculo em vez de refazê-lo."""
+    saldo_df = parse_saldo(load_saldo_raw())
+    maxmin_df = parse_maxmin(load_maxmin_raw())
+    consumo_df = parse_consumo(load_consumo_raw())
+    return calcular_romaneios(saldo_df, maxmin_df, consumo_df)
 
-resultado = st.session_state.get("resultado")
-sem_destino = st.session_state.get("sem_destino")
 
-if sem_destino is None:
-    sem_destino = pd.DataFrame()
+with st.spinner("Carregando planilhas e calculando romaneios..."):
+    try:
+        resultado, sem_destino = carregar_romaneios()
+    except Exception as e:
+        st.error(f"Erro ao processar os dados: {e}")
+        st.stop()
 
 def render_sem_destino(sem_destino: pd.DataFrame) -> None:
     st.caption(
@@ -499,37 +499,45 @@ def render_romaneios(
         st.success(msg_vazio)
         return
 
-    corte_dde = "Todos"
-    if age_fora or filtro_dde:
-        c1, c2 = st.columns([1, 2])
-        if age_fora:
-            with c1:
-                todas_age = st.checkbox(
-                    "Incluir todas as AGE",
-                    key=f"{chave}_todas_age",
-                    help=f"Por padrão ficam fora: {', '.join(age_fora)}",
-                )
-            if not todas_age:
-                resultado = _sem_age_fora(resultado, age_fora)
-        if filtro_dde:
-            with c2:
-                corte_dde = st.radio(
-                    "DDE da origem",
-                    CORTES_DDE,
-                    horizontal=True,
-                    key=f"{chave}_dde",
-                    help="Itens sem consumo em 6 meses (DDE vazio) entram em qualquer corte",
-                )
+    # Todos os filtros numa linha; a última coluna fica vazia só para estreitar os
+    # dropdowns. O checkbox é preenchido primeiro (mesmo estando à direita)
+    # porque a exclusão de AGE muda as opções do filtro "age".
+    f_de, f_para, f_age, f_pqr, f_dde, f_todas, _ = st.columns(
+        [1, 1, 1, 1, 1, 1.2, 1.8], vertical_alignment="bottom"
+    )
+    if age_fora:
+        with f_todas:
+            todas_age = st.checkbox(
+                "Incluir todas as AGE",
+                key=f"{chave}_todas_age",
+                help=f"Por padrão ficam fora: {', '.join(age_fora)}",
+            )
+        if not todas_age:
+            resultado = _sem_age_fora(resultado, age_fora)
 
-    f1, f2, f3, f4 = st.columns(4)
-    with f1:
-        filtro_de = st.multiselect("Origem (De)", sorted(resultado["De"].unique()), key=f"{chave}_de")
-    with f2:
-        filtro_para = st.multiselect("Destino (Para)", sorted(resultado["Para"].unique()), key=f"{chave}_para")
-    with f3:
-        filtro_age = st.multiselect("age", sorted(resultado["age"].unique()), key=f"{chave}_age")
-    with f4:
-        filtro_pqr = st.multiselect("pqr", sorted(resultado["pqr"].unique()), key=f"{chave}_pqr")
+    corte_dde = "Todos"
+    if filtro_dde:
+        with f_dde:
+            corte_dde = st.selectbox(
+                "DDE da origem",
+                CORTES_DDE,
+                key=f"{chave}_dde",
+                help="Itens sem consumo em 6 meses (DDE vazio) entram em qualquer corte",
+            )
+
+    def dropdown(rotulo: str, coluna: str, sufixo: str) -> list:
+        return st.multiselect(
+            rotulo, sorted(resultado[coluna].unique()), key=f"{chave}_{sufixo}", placeholder="Todos"
+        )
+
+    with f_de:
+        filtro_de = dropdown("Origem (De)", "De", "de")
+    with f_para:
+        filtro_para = dropdown("Destino (Para)", "Para", "para")
+    with f_age:
+        filtro_age = dropdown("age", "age", "age")
+    with f_pqr:
+        filtro_pqr = dropdown("pqr", "pqr", "pqr")
 
     df_view = resultado.copy()
     if filtro_de:
@@ -608,53 +616,52 @@ def render_romaneios(
         )
 
 
-if resultado is None:
-    st.info("Clique em **Calcular Romaneios** para gerar as sugestões.")
+if resultado.empty:
+    rom_normal = rom_evacuacao = resultado
 else:
-    if resultado.empty:
-        rom_normal = rom_evacuacao = resultado
-    else:
-        rom_normal = resultado[resultado["regra"] == "normal"]
-        rom_evacuacao = resultado[resultado["regra"] == "evacuacao"]
+    rom_normal = resultado[resultado["regra"] == "normal"]
+    rom_evacuacao = resultado[resultado["regra"] == "evacuacao"]
 
-    # O checkbox fica dentro da aba, mas o rótulo é montado antes: lê o estado
-    # do widget (persistido em session_state) para a contagem bater com a tabela.
-    def qtd_aba(df: pd.DataFrame, chave: str) -> int:
-        if st.session_state.get(f"{chave}_todas_age", False):
-            return len(df)
-        return len(_sem_age_fora(df, AGE_FORA_ROMANEIOS))
 
-    aba_normal, aba_evacuacao, aba_sem_destino = st.tabs([
-        f"Romaneios ({qtd_aba(rom_normal, 'normal')})",
-        f"Distribuição máx=0 ({qtd_aba(rom_evacuacao, 'evacuacao')})",
-        f"Itens sem destino ({len(sem_destino)})",
-    ])
+# O checkbox fica dentro da aba, mas o rótulo é montado antes: lê o estado
+# do widget (persistido em session_state) para a contagem bater com a tabela.
+def qtd_aba(df: pd.DataFrame, chave: str) -> int:
+    if st.session_state.get(f"{chave}_todas_age", False):
+        return len(df)
+    return len(_sem_age_fora(df, AGE_FORA_ROMANEIOS))
 
-    with aba_normal:
-        st.caption(
-            "Transferências da regra padrão: garagens com saldo acima do máximo "
-            "abastecem as que estão abaixo, na prioridade G1 → G2 → G5 → G6 → G7 → SS."
-        )
-        render_romaneios(
-            rom_normal,
-            "normal",
-            "Nenhuma transferência necessária — todos os estoques estão dentro dos limites.",
-            age_fora=AGE_FORA_ROMANEIOS,
-            filtro_dde=True,
-        )
 
-    with aba_evacuacao:
-        st.caption(
-            "Garagens cujo estoque máximo é 0 mas têm saldo: todo o saldo é evacuado e "
-            "redistribuído entre as demais, proporcionalmente ao estoque máximo de cada uma."
-        )
-        render_romaneios(
-            rom_evacuacao,
-            "evacuacao",
-            "Nenhuma garagem com estoque máximo zerado e saldo em estoque.",
-            age_fora=AGE_FORA_ROMANEIOS,
-            filtro_dde=True,
-        )
+aba_normal, aba_evacuacao, aba_sem_destino = st.tabs([
+    f"Romaneios ({qtd_aba(rom_normal, 'normal')})",
+    f"Distribuição máx=0 ({qtd_aba(rom_evacuacao, 'evacuacao')})",
+    f"Itens sem destino ({len(sem_destino)})",
+])
 
-    with aba_sem_destino:
-        render_sem_destino(sem_destino)
+with aba_normal:
+    st.caption(
+        "Transferências da regra padrão: garagens com saldo acima do máximo "
+        "abastecem as que estão abaixo, na prioridade G1 → G2 → G5 → G6 → G7 → SS."
+    )
+    render_romaneios(
+        rom_normal,
+        "normal",
+        "Nenhuma transferência necessária — todos os estoques estão dentro dos limites.",
+        age_fora=AGE_FORA_ROMANEIOS,
+        filtro_dde=True,
+    )
+
+with aba_evacuacao:
+    st.caption(
+        "Garagens cujo estoque máximo é 0 mas têm saldo: todo o saldo é evacuado e "
+        "redistribuído entre as demais, proporcionalmente ao estoque máximo de cada uma."
+    )
+    render_romaneios(
+        rom_evacuacao,
+        "evacuacao",
+        "Nenhuma garagem com estoque máximo zerado e saldo em estoque.",
+        age_fora=AGE_FORA_ROMANEIOS,
+        filtro_dde=True,
+    )
+
+with aba_sem_destino:
+    render_sem_destino(sem_destino)
