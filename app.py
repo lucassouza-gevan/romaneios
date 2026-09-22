@@ -10,6 +10,10 @@ AGE_FORA_ROMANEIOS = ("SET", "ORD", "LPZ")
 CORTES_DDE = ["Todos", "> 30", "> 45", "> 60", "> 75", "> 90", "> 180"]
 CORTES_DDE_DEST = ["Todos", "< 7", "< 15", "< 30", "< 45", "< 60"]
 
+# Aba Entradas (compras por semana) oculta por ora; True volta a mostrá-la e a
+# ler a planilha de entradas_url
+MOSTRAR_ABA_ENTRADAS = False
+
 
 def normalize_garage(name: str) -> str:
     name = str(name).strip()
@@ -277,20 +281,21 @@ def parse_entradas(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def resumo_entradas(
+def compras_romaneio(
     entradas: pd.DataFrame, saldo_df: pd.DataFrame, codigos
 ) -> pd.DataFrame:
-    """Entradas por semana e garagem, só dos itens com romaneio sugerido.
+    """Compras (entrada NF) dos itens com romaneio sugerido, uma linha por
+    transação: semana, garagem, codigo, qtd e valor.
 
     A planilha de entradas traz quantidade, não valor: o valor é a quantidade
     vezes o preço unitário da garagem (valor ÷ saldo do relatório de saldo), com
     o preço médio do código como reserva quando a garagem não tem o item.
     """
     df = entradas[
-        entradas["codigo"].isin(set(codigos)) & entradas["garagem"].isin(GARAGE_ORDER)
+        (entradas["tipo"] == "compra")
+        & entradas["codigo"].isin(set(codigos))
+        & entradas["garagem"].isin(GARAGE_ORDER)
     ].copy()
-    if df.empty:
-        return df.assign(**{c: [] for c in ("transações compra", "valor compra")})
 
     com_saldo = saldo_df[saldo_df["saldo"] > 0].assign(
         preco=lambda d: d["valor"] / d["saldo"]
@@ -302,37 +307,44 @@ def resumo_entradas(
     df["preco"] = por_garagem.reindex(chave).to_numpy()
     df["preco"] = df["preco"].fillna(df["codigo"].map(por_codigo)).fillna(0.0)
     df["valor"] = df["qtd"] * df["preco"]
+    return df[["semana", "garagem", "codigo", "qtd", "valor"]]
 
-    agrupado = (
-        df.groupby(["semana", "garagem", "tipo"])
-        .agg(transacoes=("qtd", "size"), qtd=("qtd", "sum"), valor=("valor", "sum"))
-        .reset_index()
-    )
-    largo = agrupado.pivot_table(
-        index=["semana", "garagem"],
-        columns="tipo",
-        values=["transacoes", "qtd", "valor"],
-        fill_value=0,
-    )
-    largo.columns = [f"{medida}|{tipo}" for medida, tipo in largo.columns]
-    largo = largo.reset_index()
-    for coluna_faltante in [
-        f"{m}|{t}" for m in ("transacoes", "qtd", "valor") for t in ("compra", "romaneio")
-    ]:
-        if coluna_faltante not in largo.columns:
-            largo[coluna_faltante] = 0
 
-    largo = largo.rename(columns={
-        "transacoes|compra": "transações compra",
-        "qtd|compra": "qtde comprada",
-        "valor|compra": "valor comprado",
-        "transacoes|romaneio": "transações romaneio",
-        "qtd|romaneio": "qtde transferida",
-        "valor|romaneio": "valor transferido",
-    })
-    ordem = ["semana", "garagem", "transações compra", "qtde comprada", "valor comprado",
-             "transações romaneio", "qtde transferida", "valor transferido"]
-    return largo[ordem].sort_values(["semana", "garagem"]).reset_index(drop=True)
+@st.cache_data(ttl=300, show_spinner=False)
+def load_excecao_raw() -> pd.DataFrame:
+    """Lê a aba publicada da lista de exceção (CSV) de st.secrets['lista_excecao']."""
+    try:
+        url = st.secrets["lista_excecao"]
+    except (KeyError, FileNotFoundError):
+        raise RuntimeError(
+            "secret 'lista_excecao' não encontrado. Defina a URL da aba "
+            "lista_exceção publicada nos secrets do Streamlit."
+        )
+    return pd.read_csv(_to_csv_url(url), dtype=str)
+
+
+def parse_excecao(df: pd.DataFrame) -> frozenset:
+    """Lista de exceção com colunas código e depósito. Cada par (garagem, código)
+    não envia o item em romaneio. Depósito vazio vale para todas as garagens."""
+    df = df.copy()
+    df.columns = [_sem_acento(c).strip().lower() for c in df.columns]
+    col_cod = next((c for c in df.columns if c.startswith("cod")), None)
+    col_dep = next((c for c in df.columns if c.startswith("dep")), None)
+    if col_cod is None or col_dep is None:
+        # Sem gid, a URL publicada devolve a 1ª aba da planilha (o saldo)
+        raise RuntimeError(
+            "colunas 'código' e 'depósito' não encontradas. Confira se a URL do "
+            "secret 'lista_excecao' aponta para a aba lista_exceção (com gid=...)."
+        )
+
+    pares = set()
+    for codigo, deposito in zip(_numero_br(df[col_cod]), df[col_dep].fillna("")):
+        if pd.isna(codigo):
+            continue
+        garagem = normalize_garage(deposito).upper()
+        for g in [garagem] if garagem else GARAGE_ORDER:
+            pares.add((g, int(codigo)))
+    return frozenset(pares)
 
 
 def _arredondar_maior_resto(alocacao: dict, total: int) -> dict:
@@ -375,7 +387,12 @@ def _distribuir_proporcional(total: int, destinos: dict) -> dict:
     return _arredondar_maior_resto(alocacao, total)
 
 
-def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_df: pd.DataFrame):
+def calcular_romaneios(
+    saldo_df: pd.DataFrame,
+    maxmin_df: pd.DataFrame,
+    consumo_df: pd.DataFrame,
+    nao_envia: frozenset = frozenset(),
+):
     """Retorna (romaneios, itens_sem_destino).
 
     Duas fases por produto:
@@ -385,6 +402,9 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_
           prioridade de GARAGE_ORDER.
     Produtos com saldo em máx=0 e nenhuma garagem com máx>0 não têm destino
     possível e vão para a lista `itens_sem_destino`.
+
+    `nao_envia` traz os pares (garagem, codigo) da lista de exceção: essa
+    garagem não envia o item em nenhuma das fases, mas ainda pode recebê-lo.
     """
     # Parte do máx/mín: o relatório de saldo omite garagens com estoque zerado, e
     # com um inner join elas sumiam do cálculo e nunca recebiam romaneio. Ficam
@@ -450,8 +470,13 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_
         saldo_atual = dict(saldo_orig)
 
         # ── (a) evacuação das garagens com máx = 0 ──────────────────────────
+        # Garagens da lista de exceção não enviam este item (mas podem receber).
+        # Numa garagem de máx=0 o saldo fica parado: nem evacua, nem vai para
+        # "sem destino".
+        bloqueadas = {g for g in saldo_atual if (g, product_code) in nao_envia}
         origens_zero = {
-            g: s for g, s in saldo_atual.items() if est_max.get(g, 0) == 0 and s > 0
+            g: s for g, s in saldo_atual.items()
+            if est_max.get(g, 0) == 0 and s > 0 and g not in bloqueadas
         }
         # Lista (não set) e na ordem canônica: a ordem influencia o desempate do
         # arredondamento, e um set daria resultados diferentes a cada execução.
@@ -493,7 +518,7 @@ def calcular_romaneios(saldo_df: pd.DataFrame, maxmin_df: pd.DataFrame, consumo_
         surplus = {
             g: saldo_atual[g] - est_max[g]
             for g in saldo_atual
-            if est_max.get(g, 0) > 0 and saldo_atual[g] > est_max[g]
+            if est_max.get(g, 0) > 0 and saldo_atual[g] > est_max[g] and g not in bloqueadas
         }
         deficit = {
             g: est_max[g] - saldo_atual[g]
@@ -539,34 +564,49 @@ st.subheader("Sugestão de Romaneios entre Garagens")
 
 
 @st.cache_data(ttl=300, show_spinner=False)
-def carregar_romaneios():
+def carregar_romaneios(com_entradas: bool):
     """Lê as planilhas e calcula ao abrir a página. Mesmo cache de 5 min das
     leituras: mexer em filtros (cada um dispara um rerun) ou recarregar a página
     dentro desse prazo reaproveita o cálculo em vez de refazê-lo."""
     saldo_df = parse_saldo(load_saldo_raw())
     maxmin_df = parse_maxmin(load_maxmin_raw())
     consumo_df = parse_consumo(load_consumo_raw())
-    resultado, sem_destino = calcular_romaneios(saldo_df, maxmin_df, consumo_df)
+
+    # Lista de exceção: se faltar o secret ou a leitura falhar, calcula sem ela e
+    # avisa no topo da página, em vez de derrubar o app.
+    try:
+        nao_envia, erro_excecao = parse_excecao(load_excecao_raw()), ""
+    except Exception as e:
+        nao_envia, erro_excecao = frozenset(), str(e)
+    resultado, sem_destino = calcular_romaneios(saldo_df, maxmin_df, consumo_df, nao_envia)
 
     # A aba de entradas é extra: se faltar o secret ou a leitura falhar, o resto
     # do app continua funcionando e a aba Entradas mostra o motivo.
-    try:
-        entradas = resumo_entradas(
-            parse_entradas(load_entradas_raw()), saldo_df, resultado["Código"].unique()
-        )
-        erro_entradas = ""
-    except Exception as e:
-        entradas, erro_entradas = pd.DataFrame(), str(e)
+    # `com_entradas` vem como argumento (não lido da constante) para entrar na
+    # chave do cache: ligar a aba não pode reaproveitar um resultado sem entradas.
+    entradas, erro_entradas = pd.DataFrame(), ""
+    if com_entradas:
+        try:
+            entradas = compras_romaneio(
+                parse_entradas(load_entradas_raw()), saldo_df, resultado["Código"].unique()
+            )
+        except Exception as e:
+            erro_entradas = str(e)
 
-    return resultado, sem_destino, entradas, erro_entradas
+    return resultado, sem_destino, entradas, erro_entradas, erro_excecao
 
 
 with st.spinner("Carregando planilhas e calculando romaneios..."):
     try:
-        resultado, sem_destino, entradas, erro_entradas = carregar_romaneios()
+        resultado, sem_destino, entradas, erro_entradas, erro_excecao = carregar_romaneios(
+            MOSTRAR_ABA_ENTRADAS
+        )
     except Exception as e:
         st.error(f"Erro ao processar os dados: {e}")
         st.stop()
+
+if erro_excecao:
+    st.warning(f"Lista de exceção não aplicada: {erro_excecao}")
 
 def render_sem_destino(sem_destino: pd.DataFrame) -> None:
     st.caption(
@@ -607,51 +647,86 @@ def render_sem_destino(sem_destino: pd.DataFrame) -> None:
     )
 
 
-def render_entradas(entradas: pd.DataFrame, erro: str) -> None:
+def _tabela_semanal(
+    celulas: pd.DataFrame, total_semana: pd.Series, total_garagem: pd.Series, total_geral
+) -> pd.DataFrame:
+    """Semana nas linhas, garagem nas colunas, com coluna e linha de Total. Os
+    totais vêm prontos porque nem sempre são a soma das células: em produtos
+    distintos, um código comprado por duas garagens conta uma vez no total."""
+    t = celulas.copy()
+    t["Total"] = total_semana
+    t.index = t.index.strftime("%d/%m/%Y")
+    t.loc["Total"] = list(total_garagem.reindex(celulas.columns, fill_value=0)) + [total_geral]
+    t.columns.name = None
+    return t.rename_axis("semana").reset_index()
+
+
+def render_entradas(compras: pd.DataFrame, erro: str) -> None:
     st.caption(
-        "Entradas por compra (NF) e por romaneio, semana a semana, apenas dos itens "
-        "com romaneio sugerido. O valor é a quantidade vezes o preço unitário da "
+        "Compras (entrada NF) por semana dos itens com romaneio sugerido nas abas "
+        "Romaneios e Distribuição máx=0. Valor = quantidade × preço unitário da "
         "garagem (valor ÷ saldo do relatório de saldo)."
     )
     if erro:
         st.warning(f"Não foi possível ler a aba de entradas: {erro}")
         return
-    if entradas.empty:
-        st.info("Nenhuma entrada dos itens com romaneio sugerido no período.")
+    if compras.empty:
+        st.info("Nenhuma compra dos itens com romaneio sugerido no período.")
         return
 
-    garagens = [g for g in GARAGE_ORDER if g in set(entradas["garagem"])]
-    filtro_gar = st.multiselect(
-        "Garagem", garagens, key="entradas_garagem", placeholder="Todas"
+    m1, m2, m3 = st.columns(3)
+    m1.metric("Valor comprado", formatar_brl(compras["valor"].sum()))
+    m2.metric("Produtos comprados", compras["codigo"].nunique())
+    m3.metric("Transações de compra", len(compras))
+
+    garagens = [g for g in GARAGE_ORDER if g in set(compras["garagem"])]
+    por_semana = compras.groupby("semana")
+    por_garagem = compras.groupby("garagem")
+
+    def pivo(coluna: str, agregacao: str) -> pd.DataFrame:
+        return compras.pivot_table(
+            index="semana", columns="garagem", values=coluna, aggfunc=agregacao, fill_value=0
+        ).reindex(columns=garagens, fill_value=0)
+
+    valor = _tabela_semanal(
+        pivo("valor", "sum"),
+        por_semana["valor"].sum(),
+        por_garagem["valor"].sum(),
+        compras["valor"].sum(),
     )
-    df_view = entradas[entradas["garagem"].isin(filtro_gar)] if filtro_gar else entradas
+    produtos = _tabela_semanal(
+        pivo("codigo", "nunique"),
+        por_semana["codigo"].nunique(),
+        por_garagem["codigo"].nunique(),
+        compras["codigo"].nunique(),
+    )
 
-    m1, m2, m3, m4 = st.columns(4)
-    m1.metric("Valor comprado", formatar_brl(df_view["valor comprado"].sum()))
-    m2.metric("Transações de compra", int(df_view["transações compra"].sum()))
-    m3.metric("Valor transferido", formatar_brl(df_view["valor transferido"].sum()))
-    m4.metric("Transações de romaneio", int(df_view["transações romaneio"].sum()))
-
-    st.divider()
-
-    centro = st.column_config.Column(alignment="center")
-    inteiro = st.column_config.NumberColumn(format="%d")
+    semana = st.column_config.Column(alignment="center")
     reais = st.column_config.NumberColumn(format="localized", step=0.1)
-    st.dataframe(
-        df_view,
-        use_container_width=True,
-        hide_index=True,
-        column_config={
-            "semana": st.column_config.DateColumn(format="DD/MM/YYYY", alignment="center"),
-            "garagem": centro,
-            "transações compra": inteiro,
-            "qtde comprada": inteiro,
-            "valor comprado": reais,
-            "transações romaneio": inteiro,
-            "qtde transferida": inteiro,
-            "valor transferido": reais,
-        },
-    )
+    inteiro = st.column_config.NumberColumn(format="%d")
+    colunas = garagens + ["Total"]
+
+    t1, t2 = st.columns(2)
+    with t1:
+        st.markdown("**Valor comprado (R$)**")
+        st.dataframe(
+            valor,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"semana": semana, **{c: reais for c in colunas}},
+        )
+    with t2:
+        st.markdown(
+            "**Produtos comprados**",
+            help="Códigos diferentes comprados. No Total, um código comprado por "
+            "mais de uma garagem conta uma vez.",
+        )
+        st.dataframe(
+            produtos,
+            use_container_width=True,
+            hide_index=True,
+            column_config={"semana": semana, **{c: inteiro for c in colunas}},
+        )
 
 
 def _sem_age_fora(df: pd.DataFrame, age_fora: tuple) -> pd.DataFrame:
@@ -831,12 +906,12 @@ def qtd_aba(df: pd.DataFrame, chave: str) -> int:
     return len(_sem_age_fora(df, AGE_FORA_ROMANEIOS))
 
 
-aba_normal, aba_evacuacao, aba_sem_destino, aba_entradas = st.tabs([
+abas = st.tabs([
     f"Romaneios ({qtd_aba(rom_normal, 'normal')})",
     f"Distribuição máx=0 ({qtd_aba(rom_evacuacao, 'evacuacao')})",
     f"Itens sem destino ({len(sem_destino)})",
-    "Entradas",
-])
+] + (["Entradas"] if MOSTRAR_ABA_ENTRADAS else []))
+aba_normal, aba_evacuacao, aba_sem_destino = abas[:3]
 
 with aba_normal:
     st.caption(
@@ -867,5 +942,6 @@ with aba_evacuacao:
 with aba_sem_destino:
     render_sem_destino(sem_destino)
 
-with aba_entradas:
-    render_entradas(entradas, erro_entradas)
+if MOSTRAR_ABA_ENTRADAS:
+    with abas[3]:
+        render_entradas(entradas, erro_entradas)
