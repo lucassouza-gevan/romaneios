@@ -1,3 +1,5 @@
-streamlit
-pandas
-openpyxl
+# Versões fixas: sem elas o pip fica testando combinações de pandas no deploy
+# (um timeout do PyPI chegou a derrubar a instalação no Streamlit Cloud).
+# openpyxl saiu: o app lê só CSV das planilhas publicadas.
+streamlit==1.57.0
+pandas==3.0.2
